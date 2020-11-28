@@ -5,40 +5,43 @@
 #include <chrono>
 #include <string>
 #include<queue>
+#include<vector>
 #include<condition_variable>
 using namespace std;
 
 const int NumTasks = 1024 * 1024;
 const int NumThreads[] = { 4, 8, 16, 32 };
-int pointer = 0;
 mutex mtx;
 atomic<int> atomic_ptr{0};
+
+int pointer = 0;
 void thread_proc_using_mutex(int* Arr, int sleep)
 {
-	while (pointer < NumTasks)
+	int local_pointer;
+	while (true)
 	{
 		mtx.lock();
-		if (pointer < NumTasks)
+		local_pointer = pointer++;
+		mtx.unlock();
+		if (local_pointer < NumTasks)
 		{
-			Arr[pointer] += 1;
-			pointer++;
+			++Arr[local_pointer];
 			if (sleep)
 				this_thread::sleep_for(chrono::nanoseconds(sleep));
 		}
-		mtx.unlock();
+		else break;
 	}
 	return;
 }
+
 int getAtomicPtrValue(int sleep)
 {
-	int old = atomic_ptr.load();
-	int newvalue = old;
-	do {
-		newvalue = old + 1;
-		if(sleep)
-			this_thread::sleep_for(chrono::nanoseconds(sleep));
-	} while (!atomic_ptr.compare_exchange_strong(old, newvalue));
-	return newvalue;
+	int pointer = ++atomic_ptr;
+	if (sleep)
+	{
+		this_thread::sleep_for(chrono::nanoseconds(sleep));
+	}
+	return pointer;
 }
 void thread_proc_using_atomic(int* Arr, int sleep)
 {
@@ -99,7 +102,7 @@ void task_1(int* Arr)
 	std::cout << "====================Using atomic==================== " << endl;
 	subtask_1(Arr, thread_proc_using_atomic);
 	std::cout << "====================Using atomic(sleep = 10ns)==================== " << endl;
-	subtask_1(Arr, thread_proc_using_mutex, 10); 
+	subtask_1(Arr, thread_proc_using_atomic, 10); 
 	return;
 }
 ///////////////// task 2 //////////////////////////////////////////////////////////
@@ -108,33 +111,33 @@ const int ConsumerNum[] = { 1,2,4 };
 const int QueueSize[] = { 1, 4, 16 };
 const int TaskNum = 1024 * 1024;// 4 * 1024 * 1024
 
-__interface IQueue
+class IQueue
 {
+protected:
+	size_t size = 0;
+	mutex mtx;
+	queue<int8_t> q;
+	condition_variable cond;
 public:
-	void push(int8_t val);
-	bool pop(int8_t& val);
-	bool empty();
+	int active_producers_count = 0;
+	int ResultSum = 0;
+	virtual void push(int8_t val) = 0;
+	virtual bool pop(int8_t& val) = 0;
+	virtual bool empty() = 0;
 };
 class DynamicSizeQueue : public IQueue
 {
-	queue<uint8_t> q;
-	mutex mtx;
 public:
-	mutex mtx_for_result_sum;
-	int active_producers_count = 0;
-	int ResultSum = 0;
-	DynamicSizeQueue()
-	{
-	}
-	void push(int8_t val)
+	DynamicSizeQueue(){}
+	void push(int8_t val) override
 	{
 		lock_guard<mutex> lock(mtx);
 		q.push(val);
 	}
-	bool pop(int8_t& val)
+	bool pop(int8_t& val) override
 	{
 		lock_guard<mutex> lock(mtx);
-		if (q.empty())
+		if (this->empty())
 		{
 			return false;
 		}
@@ -145,96 +148,70 @@ public:
 			return true;
 		}
 	}
-	bool empty() {
-		std::lock_guard<std::mutex> lock(mtx);
+	bool empty() override {
+		//std::lock_guard<std::mutex> lock(mtx);
 		return q.empty();
 	}
 };
-void produce(DynamicSizeQueue *q)
-{
-	for (int i = 0;i < TaskNum;i++) {
-		q->push(1);
-	}
-	q->active_producers_count--;
-}
-void consume(DynamicSizeQueue *q)
-{
-	int current_result = 0;
-	while(q->active_producers_count > 0 || !q->empty()) {
-		int8_t val;
-		if (q->pop(val)) {
-			current_result += val;
-		}
-	}
-	q->mtx_for_result_sum.lock();
-	q->ResultSum += current_result;
-	q->mtx_for_result_sum.unlock();
-	return;
-}
 class FixedSizeQueue : public IQueue
 {
-	size_t size;
-	mutex mtx;
-	queue<int8_t> q;
-	condition_variable cond;
-public:
-	mutex mtx_for_result_sum;
-	mutex del_mtx;
-	int active_producers_count;
-	int ResultSum = 0;
+	public:
 	FixedSizeQueue(size_t s, int count)
 	{
 		size = s;
 		active_producers_count = count;
 	}
-	void push(int8_t value) 
+	void push(int8_t value) override
 	{
 		unique_lock<mutex> lock(mtx);
 		cond.wait(lock, [this] {return q.size() < size;});
 		q.push(value);
 		cond.notify_one();
 	}
-	bool pop(int8_t& value)
+	bool pop(int8_t& value) override
 	{
 		unique_lock<mutex> lock(mtx);
-		cond.wait(lock, [this] {return !q.empty();});
+		if (!cond.wait_for(lock, std::chrono::milliseconds(10), [this] {return !q.empty();}))
+		{
+			return false;
+		}
 		value = q.front();
-		if(value!=-1)
-			q.pop();
+		q.pop();
 		cond.notify_one();
 		return true;
 	}
-	bool empty() {
+	bool empty() override 
+	{
 		unique_lock<mutex> lock(mtx);
 		return q.empty();
 	}
 };
-void produce_fixed_size(FixedSizeQueue *q)
+mutex del_mtx;
+mutex mtx_for_result_sum;
+void produce(IQueue* q)
 {
 	for (int i = 0;i < TaskNum;i++) {
 		q->push(1);
 	}
-	unique_lock<mutex>lock(q->del_mtx);
+	del_mtx.lock();
 	q->active_producers_count--;
-	if (q->active_producers_count == 0)
-		q->push(-1);
-}	  
-void consume_fixed_size(FixedSizeQueue* q)
+	del_mtx.unlock();
+
+}
+mutex consumer_mtx;
+void consume(IQueue* q)
 {
 	int current_result = 0;
-	while (true)
-	{
+	while (q->active_producers_count > 0 || !q->empty()) {
 		int8_t val;
-		q->pop(val);
-		if (val == -1) {
-			q->mtx_for_result_sum.lock();
-			q->ResultSum += current_result;
-			q->mtx_for_result_sum.unlock();
-			return;
+		if (q->pop(val)) {
+			current_result += val;
 		}
-		current_result += val;
 	}
-
+	mtx_for_result_sum.lock();
+	q->ResultSum += current_result;
+	mtx_for_result_sum.unlock();
+	return;
 }
 void task_2()
 {
@@ -263,8 +240,8 @@ void task_2()
 		chrono::duration<float> duration = end - start;
 		cout << "Time: " << duration.count() << endl;
 	}
+	cout << "=========================Fixed Size Queue========================" << endl;
 	for (int k = 0; k < 3; k++) {
-		cout << "=========================Fixed Size Queue========================" << endl;
 		cout << "======= (Produsers: " << ProducerNum[k] << "\tConsumers: " << ConsumerNum[k] << "\tQueue Size: " << QueueSize[k] << ") =======" << endl;
 		thread* producers = new thread[ProducerNum[k]];
 		thread* consumers = new thread[ConsumerNum[k]];
@@ -273,20 +250,17 @@ void task_2()
 		auto start = chrono::high_resolution_clock::now();
 
 		for (int i = 0;i < ConsumerNum[k];i++) {
-			producers[i] = std::thread(produce_fixed_size, &q);
-			consumers[i] = std::thread(consume_fixed_size, &q);
+			producers[i] = std::thread(produce, &q);
+			consumers[i] = std::thread(consume, &q);
 		}
 		for (int i = 0;i < ConsumerNum[k];i++) {
 			producers[i].join();
 			consumers[i].join();
 		}
-
-		cout << "Sum " << q.ResultSum << std::endl << "Right : " << TaskNum * ProducerNum[k] << endl;
-
 		auto end = chrono::high_resolution_clock::now();
 		chrono::duration<float> duration = end - start;
-		cout << "Time: " << duration.count() << endl;
-
+		cout << "Sum " << q.ResultSum << std::endl << "Right : " << TaskNum * ProducerNum[k] << endl;
+		cout << "Time: " << duration.count() << endl;;
 	}
 
 }
